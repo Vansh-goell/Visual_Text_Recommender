@@ -1,0 +1,314 @@
+
+# Model
+# ├── 📷 Image Branch
+# │   ├── ResNet50 (frozen)
+# │   │   └── Output: 2048-d
+# │   └── img_proj (Dense 256 + ReLU)
+# │       └── Output: 256-d
+# │
+# ├── 📝 Text Branch
+# │   ├── Universal Sentence Encoder (USE)
+# │   │   └── Output: 512-d
+# │   └── txt_proj (Dense 256 + ReLU)
+# │       └── Output: 256-d
+# │
+# ├── 🔗 Fusion
+# │   ├── Concatenate (img_proj + txt_proj) → 512-d
+# │   └── fusion_head
+# │       ├── Dense(128)
+# │       └── L2 Normalize
+# │           └── Output: 128-d embedding (final joint embedding)
+
+
+
+OR
+
+
+Triplet(anchor, positive, negative) 
+    ↓
+[Load images + Extract keywords]
+    ↓
+[Image Branch: ResNet50 → Dense(256)]
+[Text Branch: USE → Dense(256)]
+    ↓
+[Fusion: Concatenate → Dense(128) → L2Normalize]
+    ↓
+triplet_loss(anchor_emb, positive_emb, negative_emb)
+    ↓
+Backpropagation + Adam optimizer
+
+
+
+
+
+import os
+
+""" # ✅ Enables CPU-optimized oneDNN ops (speeds up training)
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '1'
+
+# ✅ Optional: Set visible threads (for reproducibility or performance tuning)
+os.environ['OMP_NUM_THREADS'] = '8'   # same as number of cores
+os.environ['KMP_BLOCKTIME'] = '0'  """
+
+---->
+TF_ENABLE_ONEDNN_OPTS
+Purpose: Enables TensorFlow to use oneDNN (formerly MKL-DNN), which is a highly optimized library for deep learning operations on CPUs.
+Benefit: This can significantly speed up model training and inference on machines without a GPU, as it uses advanced CPU instructions and parallelism.
+
+---->
+KMP_BLOCKTIME
+Purpose: Controls how long threads should wait (in a "hot" state) after completing a parallel region before sleeping.
+Value 0: Threads go to sleep immediately, which can reduce CPU usage when the program is idle or between training steps.
+Why you needed it: If you noticed high CPU usage even when your model was not actively training, setting this to 0 helps reduce unnecessary CPU consumption and can improve resource sharing with other processes.
+Reduces CPU Usage: When a thread sleeps, it releases the CPU, allowing other threads or processes to run. This prevents a single thread from monopolizing system resources.
+If all threads stay "hot," they compete for CPU time, causing context switching and inefficiency.
+By sleeping when idle, threads allow other programs (or other threads from different processes) to use the CPU, making the system more responsive and fair.
+
+
+---->
+OMP_NUM_THREADS sets the number of threads that OpenMP (a parallel computing library used by many scientific and machine learning libraries) can use for parallel tasks.
+
+
+
+------------------------------------------------------------------------------------------------------------------------------------------
+
+
+# ✅ Set CPU parallelism (you have 8 cores → use 8 intra, 2 inter threads)
+tf.config.threading.set_intra_op_parallelism_threads(8)
+tf.config.threading.set_inter_op_parallelism_threads(2)
+
+print("Threading set: Intra=8, Inter=2")
+
+
+
+---->
+set_intra_op_parallelism_threads(N)
+Sets the number of threads used for parallelizing the execution of operations (ops) within an individual TensorFlow operation.
+set_inter_op_parallelism_threads(M)
+Sets the number of threads used for parallelizing the execution of multiple operations (ops) that are independent and can run in parallel.
+
+---->
+Intra-op (Intra-operation) Parallelism:
+Controls how many CPU threads TensorFlow can use to execute a single operation (like a matrix multiplication) in parallel.
+Example:
+If an operation (e.g., a large matrix multiply) can be split into smaller tasks, TensorFlow will use up to N threads (as set by set_intra_op_parallelism_threads(N)) to execute those tasks simultaneously.
+
+---->
+Inter-op (Inter-operation) Parallelism:
+Controls how many independent TensorFlow operations can be executed in parallel.
+Example:
+If your computation graph has several independent operations that do not depend on each other, TensorFlow can run up to M of them in parallel (as set by set_inter_op_parallelism_threads(M)).
+
+---->
+set_inter_op_parallelism_threads(2)
+Allows up to 2 independent operations (from the computation graph) to run at the same time.
+These operations must not depend on each other (they can execute in parallel).
+set_intra_op_parallelism_threads(8)
+For each of those operations, TensorFlow can use up to 8 CPU threads to perform the computation in parallel (such as matrix multiplication, convolution, etc.).
+
+
+-----------------------------------------------------------------------------------------------------------------------------------------------
+
+
+image_keywords = defaultdict(set)  
+---->
+#it is a dict having key as image 1.jpg and value as set of noun words
+# Creates an empty defaultdict where each value is a set.
+# 💡 Why: We’ll store, for each image, the set of all nouns found in its captions.
+# ✨ Benefit: No need to check if the key exists before adding to it.
+
+-----------------------------------------------------------------------------------------------------------------------------------------------
+
+
+def build_image_branch():
+    img_in = Input(shape=(224,224,3), name="image_input")
+    base = tf.keras.applications.ResNet50(include_top=False, pooling="avg", weights="imagenet")
+    base.trainable = False
+    x = base(img_in)
+    x = layers.Dense(256, activation="relu")(x)
+    return Model(img_in, x, name="ImageBranch")
+
+---->
+
+x = base(img_in)
+Passes the input image through the ResNet50 backbone to get a feature vector.
+x = layers.Dense(256, activation="relu")(x)
+
+
+-----------------------------------------------------------------------------------------------------------------------------------------------
+
+
+def build_triplet_dataset(triplets, image_captions, img_size=(224,224), batch_size=16):  
+    def gen():  
+        for a,p,n in triplets:  
+            yield (  
+                f"flickr8k/images/{a}", image_captions[a][0],  
+                f"flickr8k/images/{p}", image_captions[p][0],  
+                f"flickr8k/images/{n}", image_captions[n][0],  
+            )  
+
+    
+    ds = tf.data.Dataset.from_generator(
+        gen,
+        output_signature=(
+            tf.TensorSpec((), tf.string), tf.TensorSpec((), tf.string),
+            tf.TensorSpec((), tf.string), tf.TensorSpec((), tf.string),
+            tf.TensorSpec((), tf.string), tf.TensorSpec((), tf.string),
+        )
+    )
+    def parse(a_path, a_txt, p_path, p_txt, n_path, n_txt):  
+        def load_img(path):  
+            img = tf.io.read_file(path)  
+            img = tf.image.decode_jpeg(img, channels=3)  
+            img = tf.image.resize(img, img_size)/255.0  
+            return img  
+        return (
+            load_img(a_path), a_txt,
+            load_img(p_path), p_txt,
+            load_img(n_path), n_txt,
+        )
+    return (
+        ds
+        .map(parse, num_parallel_calls=tf.data.AUTOTUNE)
+        .shuffle(1000)
+        .batch(batch_size)
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+
+---->
+def gen()
+
+Produces one training sample at a time for TensorFlow.
+How it works:
+Iterates over each triplet (a, p, n) (anchor, positive, negative).
+For each image in the triplet:
+Constructs the full image path (e.g., "flickr8k/images/1001773457_577c3a7d70.jpg").
+Retrieves the first caption or keyword sentence for that image (image_captions[a]).
+Yields:
+A tuple of six elements: anchor image path, anchor text, positive image path, positive text, negative image path, negative text.
+
+
+---->
+
+    def parse(a_path, a_txt, p_path, p_txt, n_path, n_txt):
+        def load_img(path):
+            img = tf.io.read_file(path)
+            img = tf.image.decode_jpeg(img, channels=3)
+            img = tf.image.resize(img, img_size)/255.0
+            return img
+        return (
+            load_img(a_path), a_txt,
+            load_img(p_path), p_txt,
+            load_img(n_path), n_txt,
+        )
+
+
+Purpose:
+Converts file paths to actual image tensors and leaves the text as-is.
+How it works:
+load_img(path): Reads the image file, decodes it as an RGB image, resizes it to img_size, and normalizes pixel values to ``.
+For each triplet, returns three processed images and their corresponding texts
+
+
+---->
+
+    return (
+        ds
+        .map(parse, num_parallel_calls=tf.data.AUTOTUNE)
+        .shuffle(1000)
+        .batch(batch_size)
+        .prefetch(tf.data.AUTOTUNE)
+    )
+
+
+.map(parse, ...):
+Applies the parse function to every element, converting image paths to image tensors.
+.map(parse, num_parallel_calls=tf.data.AUTOTUNE)
+What it does:
+Applies the parse function to each element in the dataset (ds).
+Converts image paths to actual image tensors, so the model receives images, not just file paths.
+Runs in parallel for speed (number of threads auto-selected).
+
+.shuffle(1000):
+Randomizes the order of samples (buffer size 1000) to improve training.
+
+.batch(batch_size):
+Groups samples into batches for efficient training.
+
+.prefetch(tf.data.AUTOTUNE):
+Allows TensorFlow to prepare the next batch while the current one is being processed, speeding up training.
+
+---->
+
+ds = tf.data.Dataset.from_generator(
+    gen,
+    output_signature=(
+        tf.TensorSpec((), tf.string), tf.TensorSpec((), tf.string),
+        tf.TensorSpec((), tf.string), tf.TensorSpec((), tf.string),
+        tf.TensorSpec((), tf.string), tf.TensorSpec((), tf.string),
+    )
+)
+
+
+What it does:
+Uses TensorFlow's from_generator to turn the Python generator into a TensorFlow Dataset object (ds).
+What is output_signature:
+Tells TensorFlow that each yielded value is a scalar string (for all six outputs).
+What ds is now:
+A TensorFlow Dataset where each element is a tuple of six strings.
+
+---->
+
+4. How Does Everything Connect?
+You call build_triplet_dataset(triplets, image_captions)
+It creates a generator (gen) that yields triplet data.
+Wraps that generator in a TensorFlow Dataset (ds).
+Defines a parse function to load and preprocess images.
+Maps parse over the dataset, shuffles, batches, and prefetches.
+What you get back:
+A ready-to-use TensorFlow Dataset object that yields batches of preprocessed triplets for your model.
+
+
+
+-----------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+def build_fusion_model(embed_dim=128):
+    img_in = Input(shape=(256,), name="image_features")
+    txt_in = Input(shape=(256,), name="text_features")
+    merged = layers.Concatenate()([img_in, txt_in])
+    x = layers.Dense(embed_dim, name="fusion_dense")(merged)
+    x = layers.Lambda(
+        lambda y: tf.math.l2_normalize(y, axis=1),
+        output_shape=lambda s: s
+    )(x)
+    return Model(inputs=[img_in, txt_in], outputs=x, name="FusionModel")
+
+
+
+---->
+Line-by-Line Explanation
+img_in = Input(shape=(256,), name="image_features")
+Creates an input tensor that will carry the 256-dimensional image embedding coming from your image branch.
+shape=(256,) means one vector of length 256 per sample.
+txt_in = Input(shape=(256,), name="text_features")
+Creates a second input tensor for the 256-dimensional text embedding coming from your text branch.
+Gives it a distinct name "text_features" for clarity when inspecting the model.
+merged = layers.Concatenate()([img_in, txt_in])
+Concatenates (joins) the two 256-dimensional vectors end-to-end.
+Resulting tensor has size 512 (256 + 256).
+This step fuses visual and textual information into a single vector so the network can learn relationships across modalities.
+x = layers.Dense(embed_dim, name="fusion_dense")(merged)
+Passes the 512-dim vector through a fully connected layer.
+embed_dim (default 128) is the target dimensionality of the joint multimodal embedding.
+Learns a task-specific projection that mixes visual and textual cues.
+x = layers.Lambda(lambda y: tf.math.l2_normalize(y, axis=1), output_shape=lambda s: s)(x)
+Applies L2 normalization so every output vector has unit length (length = 1).
+Important for similarity tasks (e.g., cosine similarity, triplet loss) because distance comparisons become scale-independent.
+output_shape=lambda s: s tells Keras the tensor shape is unchanged, avoiding shape-inference errors during model saving/loading.
+return Model(inputs=[img_in, txt_in], outputs=x, name="FusionModel")
+Wraps everything into a reusable Keras Model.
+Takes two inputs (image and text embeddings) and returns one 128-dimensional normalized fusion embedding.
+You feed this output into a similarity loss (triplet loss) during training or compare it with cosine similarity during retrieval.
